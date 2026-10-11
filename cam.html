@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>カタン指先カメラ</title>
+<style>
+/* カメラ映像を全面に、操作は下の帯だけ。片手で扱える大きさにする。 */
+:root{color-scheme:dark;--bg:#0a1620;--panel:#122838;--line:#2a4b60;--ink:#ecf3f1;--muted:#9fb7c1;--accent:#f4b63f;--accent-ink:#2a1c05;--ok:#7ee0a0;--bad:#ff5a4e;
+  --font:"Zen Kaku Gothic New","Hiragino Kaku Gothic ProN","Yu Gothic",Meiryo,system-ui,sans-serif}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;overflow:hidden}
+body{background:var(--bg);color:var(--ink);font-family:var(--font);font-size:15px;line-height:1.5;display:flex;flex-direction:column}
+.view{position:relative;flex:1;min-height:0;background:#000;touch-action:manipulation}
+video,canvas{position:absolute;left:0;top:0}
+video{object-fit:fill}
+.guide{position:absolute;left:0;right:0;top:calc(env(safe-area-inset-top,0px) + 10px);text-align:center;pointer-events:none;padding:0 16px}
+.guide span{display:inline-block;background:rgba(0,0,0,.6);padding:8px 14px;border-radius:10px;font-weight:700}
+.panel{background:var(--panel);border-top:1px solid var(--line);padding:10px 16px calc(10px + env(safe-area-inset-bottom,0px));display:flex;flex-direction:column;gap:8px}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.row>*{min-width:0}
+input{font:inherit;padding:10px 12px;border-radius:8px;border:1.5px solid var(--line);background:var(--bg);color:var(--ink);flex:1 1 120px;min-width:0}
+input#code{flex:0 1 110px;text-transform:uppercase;letter-spacing:.15em;font-weight:700}
+.btn{font:700 15px/1.2 var(--font);color:var(--ink);background:transparent;border:1.5px solid var(--line);border-radius:8px;padding:10px 12px;cursor:pointer;white-space:nowrap}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+.btn:disabled{opacity:.4}
+.btn:focus-visible,input:focus-visible{outline:3px solid var(--ink);outline-offset:2px}
+.st{display:flex;gap:14px;font-size:13px;color:var(--muted);flex-wrap:wrap}
+.st b{display:inline-flex;align-items:center;gap:6px;font-weight:700}
+.st b::before{content:"";width:9px;height:9px;border-radius:50%;background:var(--bad)}
+.st b.on::before{background:var(--ok)}
+details{font-size:13px;color:var(--muted)}
+summary{cursor:pointer;font-weight:700}
+details label{display:flex;justify-content:space-between;gap:10px;margin-top:6px;align-items:center}
+details input[type=range]{flex:1;padding:0}
+</style>
+</head>
+<body>
+<div class="view" id="view">
+  <video id="video" playsinline muted autoplay></video>
+  <canvas id="cv"></canvas>
+  <div class="guide"><span id="guide">「カメラを開始」を押してください</span></div>
+</div>
+<div class="panel">
+  <div class="st"><b id="s-cam">カメラ</b><b id="s-model">手の検出</b><b id="s-ws">中継サーバー</b><b id="s-cal">位置合わせ</b></div>
+  <div class="row">
+    <input id="relay" type="url" placeholder="wss://catan-relay.xxxx.workers.dev" aria-label="中継サーバー">
+    <input id="code" type="text" maxlength="8" placeholder="コード" autocapitalize="characters" spellcheck="false" aria-label="ルームコード">
+  </div>
+  <div class="row">
+    <button class="btn primary" id="b-start" type="button">カメラを開始</button>
+    <button class="btn" id="b-cal" type="button" disabled>位置合わせ</button>
+    <button class="btn" id="b-conn" type="button">接続</button>
+    <button class="btn" id="b-flip" type="button" title="前後カメラ切替">⟲</button>
+  </div>
+  <details>
+    <summary>調整</summary>
+    <label>つまみ判定のしきい値 <input id="thr" type="range" min="0.2" max="0.6" step="0.02" value="0.38"><span id="thr-v">0.38</span></label>
+    <label>なめらかさ <input id="smooth" type="range" min="0" max="0.9" step="0.05" value="0.5"><span id="smooth-v">0.50</span></label>
+  </details>
+</div>
+
+<script src="config.js"></script>
+<script type="module">
+import {HandLandmarker, FilesetResolver} from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+
+const $=id=>document.getElementById(id);
+const KEY='catan-cam-v1';
+const MARK=0.04; // 投影画面の目印の位置（画面幅・高さに対する割合）。play.html と同じ値
+const DST=[[MARK,MARK],[1-MARK,MARK],[1-MARK,1-MARK],[MARK,1-MARK]];
+const video=$('video'), cv=$('cv'), ctx=cv.getContext('2d'), view=$('view');
+
+let cfg={relay:window.CATAN_RELAY||'',code:'',cal:null,facing:'environment',thr:0.38,smooth:0.5};
+try{Object.assign(cfg,JSON.parse(localStorage.getItem(KEY)||'{}'));}catch(e){}
+const save=()=>{try{localStorage.setItem(KEY,JSON.stringify(cfg));}catch(e){}};
+$('relay').value=cfg.relay;$('code').value=cfg.code;$('thr').value=cfg.thr;$('smooth').value=cfg.smooth;
+$('thr-v').textContent=(+cfg.thr).toFixed(2);$('smooth-v').textContent=(+cfg.smooth).toFixed(2);
+$('thr').oninput=e=>{cfg.thr=+e.target.value;$('thr-v').textContent=cfg.thr.toFixed(2);save();};
+$('smooth').oninput=e=>{cfg.smooth=+e.target.value;$('smooth-v').textContent=cfg.smooth.toFixed(2);save();};
+const setSt=(id,on,text)=>{const el=$(id);el.classList.toggle('on',on);if(text)el.textContent=text;};
+const guide=t=>{$('guide').textContent=t;};
+
+// ---------- 映像の表示サイズ（画面に収める） ----------
+let rect={x:0,y:0,w:1,h:1};
+function layout(){
+  const vw=view.clientWidth,vh=view.clientHeight,iw=video.videoWidth||16,ih=video.videoHeight||9;
+  const s=Math.min(vw/iw,vh/ih),w=iw*s,h=ih*s;
+  rect={x:(vw-w)/2,y:(vh-h)/2,w,h};
+  for(const el of [video,cv]){el.style.left=rect.x+'px';el.style.top=rect.y+'px';el.style.width=w+'px';el.style.height=h+'px';}
+  cv.width=Math.round(w*devicePixelRatio);cv.height=Math.round(h*devicePixelRatio);
+}
+addEventListener('resize',layout);
+
+// ---------- カメラ ----------
+let stream=null,landmarker=null,running=false;
+async function startCamera(){
+  if(stream)stream.getTracks().forEach(t=>t.stop());
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:cfg.facing,width:{ideal:1280},height:{ideal:720},frameRate:{ideal:30}},audio:false});
+  }catch(e){setSt('s-cam',false);guide('カメラを使えませんでした。ブラウザのカメラ許可を確認してください（'+e.name+'）');return;}
+  video.srcObject=stream;await video.play();layout();setSt('s-cam',true);
+  if(!landmarker){
+    guide('手の検出モデルを読み込み中…');
+    try{
+      const files=await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+      landmarker=await HandLandmarker.createFromOptions(files,{
+        baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',delegate:'GPU'},
+        runningMode:'VIDEO',numHands:1,minHandDetectionConfidence:0.5,minTrackingConfidence:0.5});
+      setSt('s-model',true);
+    }catch(e){setSt('s-model',false);guide('手の検出モデルを読み込めませんでした。通信状態を確認して再読み込みしてください');return;}
+  }
+  $('b-cal').disabled=false;
+  guide(cfg.cal?'手をかざすと指先を追います。親指と人差し指をつまむと「つかむ」':'まず「位置合わせ」で、映像内の投影画面の四隅をタップしてください');
+  if(!running){running=true;requestAnimationFrame(loop);}
+}
+$('b-start').onclick=startCamera;
+$('b-flip').onclick=()=>{cfg.facing=cfg.facing==='environment'?'user':'environment';save();if(stream)startCamera();};
+
+// ---------- 位置合わせ（ホモグラフィ） ----------
+let calPts=[],calibrating=false;
+const CAL_NAMES=['左上','右上','右下','左下'];
+$('b-cal').onclick=()=>{calibrating=true;calPts=[];guide('映像の中の投影画面の【左上】の目印をタップ');setSt('s-cal',false);};
+view.addEventListener('pointerdown',e=>{
+  if(!calibrating)return;
+  const nx=(e.clientX-view.getBoundingClientRect().left-rect.x)/rect.w, ny=(e.clientY-view.getBoundingClientRect().top-rect.y)/rect.h;
+  if(nx<0||nx>1||ny<0||ny>1)return;
+  calPts.push([nx,ny]);
+  if(calPts.length<4){guide('次は【'+CAL_NAMES[calPts.length]+'】の目印をタップ');return;}
+  calibrating=false;
+  const H=homography(calPts,DST);
+  if(!H){guide('4点がうまく取れませんでした。もう一度「位置合わせ」を押してください');return;}
+  cfg.cal={src:calPts,H};save();setSt('s-cal',true);guide('位置合わせ完了。手をかざしてください');
+});
+// 4点対応からホモグラフィ行列（3x3）を求める。src→dst
+function homography(src,dst){
+  const A=[],b=[];
+  for(let i=0;i<4;i++){const [x,y]=src[i],[u,v]=dst[i];
+    A.push([x,y,1,0,0,0,-u*x,-u*y]);b.push(u);
+    A.push([0,0,0,x,y,1,-v*x,-v*y]);b.push(v);}
+  const h=solve(A,b);if(!h)return null;
+  return [h[0],h[1],h[2],h[3],h[4],h[5],h[6],h[7],1];
+}
+function solve(A,b){ // ガウス消去
+  const n=b.length,M=A.map((r,i)=>r.concat([b[i]]));
+  for(let c=0;c<n;c++){
+    let p=c;for(let r=c+1;r<n;r++)if(Math.abs(M[r][c])>Math.abs(M[p][c]))p=r;
+    if(Math.abs(M[p][c])<1e-12)return null;[M[c],M[p]]=[M[p],M[c]];
+    for(let r=0;r<n;r++){if(r===c)continue;const f=M[r][c]/M[c][c];for(let k=c;k<=n;k++)M[r][k]-=f*M[c][k];}
+  }
+  return M.map((r,i)=>r[n]/r[i]);
+}
+function apply(H,x,y){const w=H[6]*x+H[7]*y+H[8];return [(H[0]*x+H[1]*y+H[2])/w,(H[3]*x+H[4]*y+H[5])/w];}
+
+// ---------- 中継サーバー ----------
+let ws=null,retry=null;
+function connect(){
+  cfg.relay=$('relay').value.trim();cfg.code=$('code').value.toUpperCase().replace(/[^A-Z0-9]/g,'');$('code').value=cfg.code;save();
+  if(ws){try{ws.onclose=null;ws.close();}catch(e){}ws=null;}clearTimeout(retry);
+  const url=cfg.relay.replace(/\/+$/,'');
+  if(!/^wss?:\/\//.test(url)||/YOUR-SUBDOMAIN/.test(url)){setSt('s-ws',false);guide('中継サーバーのアドレス（wss://…）を入れてください');return;}
+  if(cfg.code.length<4){setSt('s-ws',false);guide('投影画面に出ているルームコードを入れてください');return;}
+  try{ws=new WebSocket(url+'/room/'+cfg.code);}catch(e){setSt('s-ws',false);return;}
+  ws.onopen=()=>setSt('s-ws',true);
+  ws.onclose=()=>{setSt('s-ws',false);retry=setTimeout(connect,3000);};
+  ws.onerror=()=>{};
+}
+$('b-conn').onclick=connect;
+if(cfg.relay&&cfg.code)connect();
+let lastSend=0;
+function send(m){const now=performance.now();if(now-lastSend<40)return;lastSend=now;if(ws&&ws.readyState===1)ws.send(JSON.stringify(m));}
+
+// ---------- 検出ループ ----------
+let sx=null,sy=null,pinch=false,lostAt=0,lastTs=-1;
+function loop(){
+  if(!running)return;requestAnimationFrame(loop);
+  if(video.readyState<2||!landmarker)return;
+  const ts=performance.now();if(ts===lastTs)return;lastTs=ts;
+  let res;try{res=landmarker.detectForVideo(video,ts);}catch(e){return;}
+  const dpr=devicePixelRatio,w=cv.width,h=cv.height;
+  ctx.clearRect(0,0,w,h);
+  // 位置合わせの枠
+  if(cfg.cal||calPts.length){
+    const pts=cfg.cal&&!calibrating?cfg.cal.src:calPts;
+    ctx.lineWidth=3*dpr;ctx.strokeStyle='rgba(126,224,160,.9)';ctx.fillStyle='rgba(126,224,160,.9)';
+    pts.forEach(([x,y],i)=>{ctx.beginPath();ctx.arc(x*w,y*h,8*dpr,0,7);ctx.fill();ctx.font=`${12*dpr}px sans-serif`;ctx.fillText(CAL_NAMES[i],x*w+10*dpr,y*h-6*dpr);});
+    if(pts.length===4){ctx.beginPath();pts.forEach(([x,y],i)=>i?ctx.lineTo(x*w,y*h):ctx.moveTo(x*w,y*h));ctx.closePath();ctx.stroke();}
+  }
+  const lm=res&&res.landmarks&&res.landmarks[0];
+  if(!lm){
+    if(sx!==null&&ts-lostAt>600){sx=sy=null;if(pinch){pinch=false;}send({t:'p',h:0});}
+    else if(sx===null)send({t:'p',h:0});
+    return;
+  }
+  lostAt=ts;
+  // 指先（人差し指 8）、親指先（4）、手のサイズ（手首0〜中指付け根9）
+  const tip=lm[8],th=lm[4],size=Math.hypot(lm[0].x-lm[9].x,(lm[0].y-lm[9].y)*(h/w));
+  const d=Math.hypot(tip.x-th.x,(tip.y-th.y)*(h/w))/Math.max(size,1e-6);
+  if(!pinch&&d<cfg.thr)pinch=true;else if(pinch&&d>cfg.thr*1.35)pinch=false;
+  const a=cfg.smooth;
+  sx=sx===null?tip.x:sx*a+tip.x*(1-a);sy=sy===null?tip.y:sy*a+tip.y*(1-a);
+  // 描画
+  ctx.lineWidth=2*dpr;ctx.strokeStyle='rgba(255,255,255,.5)';
+  for(const [p,q] of [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]]){ctx.beginPath();ctx.moveTo(lm[p].x*w,lm[p].y*h);ctx.lineTo(lm[q].x*w,lm[q].y*h);ctx.stroke();}
+  ctx.fillStyle=pinch?'#f4b63f':'#7ee0a0';ctx.beginPath();ctx.arc(sx*w,sy*h,(pinch?16:11)*dpr,0,7);ctx.fill();
+  if(!cfg.cal)return;
+  const [u,v]=apply(cfg.cal.H,sx,sy);
+  const inside=u>-0.1&&u<1.1&&v>-0.1&&v<1.1;
+  send({t:'p',h:inside?1:0,x:Math.min(1.1,Math.max(-0.1,u)),y:Math.min(1.1,Math.max(-0.1,v)),g:pinch&&inside?1:0});
+}
+</script>
+</body>
+</html>
